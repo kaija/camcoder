@@ -41,106 +41,7 @@ int test()
     return 0;
 }
 
-static int rtsp_stream_keepalive(AVFormatContext *s)
-{
-    RTSPState *rt = s->priv_data;
-	if(rt->get_parameter_supported){
-		ff_rtsp_send_cmd_async(s, "GET_PARAMETER", rt->control_uri, NULL);
-	}else{
-		ff_rtsp_send_cmd_async(s, "OPTIONS", rt->control_uri, NULL);
-	}
-	return 0;
-}
-
-static int rtsp_stream_pause(AVFormatContext *s)
-{
-    RTSPState *rt = s->priv_data;
-    RTSPMessageHeader reply1, *reply = &reply1;
-
-    if (rt->state != RTSP_STATE_STREAMING)
-        return 0;
-    else if (!(rt->server_type == RTSP_SERVER_REAL && rt->need_subscription)) {
-        ff_rtsp_send_cmd(s, "PAUSE", rt->control_uri, NULL, reply, NULL);
-        if (reply->status_code != RTSP_STATUS_OK) {
-            return -1;
-        }
-    }
-    rt->state = RTSP_STATE_PAUSED;
-    return 0;
-}
-
-static int rtsp_stream_close(AVFormatContext *s)
-{
-    RTSPState *rt = s->priv_data;
-
-    if (!(rt->rtsp_flags & RTSP_FLAG_LISTEN))
-        ff_rtsp_send_cmd_async(s, "TEARDOWN", rt->control_uri, NULL);
-
-    ff_rtsp_close_streams(s);
-    ff_rtsp_close_connections(s);
-    ff_network_close();
-    rt->real_setup = NULL;
-    av_freep(&rt->real_setup_cache);
-    return 0;
-}
-
-static int rtsp_stream_play(AVFormatContext *s)
-{
-    RTSPState *rt = s->priv_data;
-    RTSPMessageHeader reply1, *reply = &reply1;
-    int i;
-    char cmd[1024];
-
-    av_log(s, AV_LOG_DEBUG, "hello state=%d\n", rt->state);
-    rt->nb_byes = 0;
-
-    if (!(rt->server_type == RTSP_SERVER_REAL && rt->need_subscription)) {
-        if (rt->transport == RTSP_TRANSPORT_RTP) {
-            for (i = 0; i < rt->nb_rtsp_streams; i++) {
-                RTSPStream *rtsp_st = rt->rtsp_streams[i];
-                RTPDemuxContext *rtpctx = rtsp_st->transport_priv;
-                if (!rtpctx)
-                    continue;
-                ff_rtp_reset_packet_queue(rtpctx);
-                rtpctx->last_rtcp_ntp_time  = AV_NOPTS_VALUE;
-                rtpctx->first_rtcp_ntp_time = AV_NOPTS_VALUE;
-                rtpctx->base_timestamp      = 0;
-                rtpctx->timestamp           = 0;
-                rtpctx->unwrapped_timestamp = 0;
-                rtpctx->rtcp_ts_offset      = 0;
-            }
-        }
-        if (rt->state == RTSP_STATE_PAUSED) {
-            cmd[0] = 0;
-        } else {
-            snprintf(cmd, sizeof(cmd),
-                     "Range: npt=%"PRId64".%03"PRId64"-\r\n",
-                     rt->seek_timestamp / AV_TIME_BASE,
-                     rt->seek_timestamp / (AV_TIME_BASE / 1000) % 1000);
-        }
-        ff_rtsp_send_cmd(s, "PLAY", rt->control_uri, cmd, reply, NULL);
-        if (reply->status_code != RTSP_STATUS_OK) {
-            return -1;
-        }
-        if (rt->transport == RTSP_TRANSPORT_RTP &&
-            reply->range_start != AV_NOPTS_VALUE) {
-            for (i = 0; i < rt->nb_rtsp_streams; i++) {
-                RTSPStream *rtsp_st = rt->rtsp_streams[i];
-                RTPDemuxContext *rtpctx = rtsp_st->transport_priv;
-                AVStream *st = NULL;
-                if (!rtpctx || rtsp_st->stream_index < 0)
-                    continue;
-                st = s->streams[rtsp_st->stream_index];
-                rtpctx->range_start_offset =
-                    av_rescale_q(reply->range_start, AV_TIME_BASE_Q,
-                                 st->time_base);
-            }
-        }
-    }
-    rt->state = RTSP_STATE_STREAMING;
-    return 0;
-}
-static int ffurl_open_only(URLContext **puc, const char *filename, int flags,
+int ffurl_open_only(URLContext **puc, const char *filename, int flags,
                const AVIOInterruptCB *int_cb, AVDictionary **options)
 {
     int ret = ffurl_alloc(puc, filename, flags, int_cb);
@@ -155,13 +56,14 @@ fail:
     *puc = NULL;
     return ret;
 }
-
-
-int rtsp_init_context(CAM_CTX *ctx)
+int record(CAM_CTX *ctx)
 {
     int err;
+    int lower_transport_mask = 0;
     int ret = 0;
-    char tcpname[1024], control_uri[1024];
+    char real_challenge[64] = "";
+    char tcpname[1024], control_uri[1024], cmd[2048];
+    RTSPMessageHeader reply1 = {0}, *reply = &reply1;
 	ctx->fmt_ctx = avformat_alloc_context();
     AVFormatContext *s = ctx->fmt_ctx;
 
@@ -171,7 +73,6 @@ int rtsp_init_context(CAM_CTX *ctx)
         goto fail;
     }
     memset(s->priv_data, 0, sizeof(RTSPState));
-
     if(!ff_network_init()) return AVERROR(EIO);
 
     //s->max_delay = s->iformat ? DEFAULT_REORDERING_DELAY: 0;
@@ -180,7 +81,9 @@ int rtsp_init_context(CAM_CTX *ctx)
     ff_url_join(tcpname, sizeof(tcpname), "tcp", NULL, ctx->host, ctx->port, "?timeout=%d", rt->stimeout);
 
     rt->control_transport = RTSP_MODE_PLAIN;
+    lower_transport_mask = rt->lower_transport_mask;
     rt->lower_transport_mask = 1 << RTSP_LOWER_TRANSPORT_TCP;
+    lower_transport_mask = 1 << RTSP_LOWER_TRANSPORT_TCP;
     if(ret = ffurl_open_only(&rt->rtsp_hd, tcpname, AVIO_FLAG_READ_WRITE, &s->interrupt_callback, NULL)){
         av_log(s, AV_LOG_ERROR, "Unable to alloc rtsp_hd\n");
         return ret;
@@ -192,28 +95,14 @@ int rtsp_init_context(CAM_CTX *ctx)
     rt->seq         = 0;
     TCPContext *tc = rt->rtsp_hd->priv_data;
     ff_url_join(rt->control_uri, sizeof(control_uri), "rtsp", NULL, ctx->host, ctx->port, "%s", ctx->path);
+    printf("%s\n", rt->control_uri);
     tc->fd = ctx->fd;
     rt->rtsp_hd->is_connected = 1;
     rt->user_agent = strdup(USER_AGENT);
     rt->rtp_port_min = 30000;
     rt->rtp_port_max = 60000;
-    rt->media_type_mask = (1 << (AVMEDIA_TYPE_DATA+1)) - 1;
     int tcp_fd = ffurl_get_file_handle(rt->rtsp_hd);
     printf("tcp_fd:%d\n", tcp_fd);
-fail:
-    return 0;
-}
-
-int rtsp_progress(CAM_CTX *ctx)
-{
-    int lower_transport_mask = 0;
-    lower_transport_mask = 1 << RTSP_LOWER_TRANSPORT_TCP;
-    int err;
-    AVFormatContext *s = ctx->fmt_ctx;
-    RTSPState *rt =  s->priv_data;
-    RTSPMessageHeader reply1 = {0}, *reply = &reply1;
-    char real_challenge[64] = "";
-    char cmd[2048];
     cmd[0] = 0;
     //OPTIONS
     ff_rtsp_send_cmd(s, "OPTIONS", rt->control_uri, cmd, reply, NULL);
@@ -253,7 +142,7 @@ int main()
 	av_register_all();
 	avformat_network_init();
 	CAM_CTX *ctx = malloc(sizeof(CAM_CTX));
-    //test();
+    test();
 	if(!ctx) return -1;
 
     sprintf(ctx->host, "10.211.55.2");
@@ -264,12 +153,7 @@ int main()
     if(fd) {
 		printf("Connected\n");
         ctx->fd = fd;
-        rtsp_init_context(ctx);
-        rtsp_progress(ctx);
-        //PLAY
-        rtsp_stream_play(ctx->fmt_ctx);
-        rtsp_stream_pause(ctx->fmt_ctx);
-        rtsp_stream_close(ctx->fmt_ctx);
+        record(ctx);
       	close(fd);
     }
 	return 0;

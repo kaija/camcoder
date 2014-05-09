@@ -14,13 +14,16 @@ LDFLAGS+= -lm
 LDFLAGS+= -lpthread
 LDFLAGS+= -lz
 
-all: noly camcoder
+all: noly camcoder test
 
 noly:
 	$(MAKE) -C noly
 
 camcoder: camcoder.o
 	$(CC) -o camcoder.exe camcoder.o $(CFLAGS) $(LDFLAGS)
+
+test: test.o
+	$(CC) -o test.exe test.o $(CFLAGS) $(LDFLAGS)
 
 clean:
 	rm -rf *.o *.exe
