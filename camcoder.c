@@ -31,14 +31,26 @@ typedef struct TCPContext {
 #include "noly.h"
 #include "camcoder.h"
 
-int test()
-{
-    AVFormatContext *pFormatCtx=NULL;
-	pFormatCtx = avformat_alloc_context();
-    //avformat_open_input(&pFormatCtx, "rtsp://192.168.15.222/ChannelID=1&ChannelName=Channel1" , NULL,NULL);
-    avformat_open_input(&pFormatCtx, "rtsp://10.211.55.2:8554/demo.264" , NULL,NULL);
-    exit(0);
-    return 0;
+AVCodecContext *rtsp_find_video_stream_avcodecctx(AVFormatContext *s){
+    int i;
+    for (i = 0; i < s->nb_streams; i++)
+    {
+        if (s->streams[i]->codec->codec_type == AVMEDIA_TYPE_VIDEO){
+            return s->streams[i]->codec;
+        }
+    }
+    return NULL;
+}
+
+AVCodec *rtsp_find_video_stream_decoder(AVFormatContext *s){
+    int i;
+    for (i = 0; i < s->nb_streams; i++)
+    {
+        if (s->streams[i]->codec->codec_type == AVMEDIA_TYPE_VIDEO){
+            return avcodec_find_decoder(s->streams[i]->codec->codec_id);
+        }
+    }
+    return NULL;
 }
 
 static int rtsp_stream_keepalive(AVFormatContext *s)
@@ -156,10 +168,26 @@ fail:
     return ret;
 }
 
+int rtsp_init_output_context(CAM_CTX *ctx)
+{
+    AVOutputFormat      *out_fmt;
+    ctx->ofmt_ctx = avformat_alloc_context();
+    if(!ctx->ofmt_ctx){
+        fprintf(stderr, "Allocate AVFormatContext failure\n");
+        return -1;
+    }
+    out_fmt = av_guess_format(DEFAULT_OUTPUT_FORMAT, NULL, NULL);
+    if(!out_fmt){
+        fprintf(stderr, "AVOutputFormat %s not found\n", DEFAULT_OUTPUT_FORMAT);
+        return -1;
+    }
+    ctx->ofmt_ctx->oformat = out_fmt;
+    return 0;
+}
 
 int rtsp_init_context(CAM_CTX *ctx)
 {
-    int err;
+    int err = 0;
     int ret = 0;
     char tcpname[1024], control_uri[1024];
 	ctx->fmt_ctx = avformat_alloc_context();
@@ -181,7 +209,7 @@ int rtsp_init_context(CAM_CTX *ctx)
 
     rt->control_transport = RTSP_MODE_PLAIN;
     rt->lower_transport_mask = 1 << RTSP_LOWER_TRANSPORT_TCP;
-    if(ret = ffurl_open_only(&rt->rtsp_hd, tcpname, AVIO_FLAG_READ_WRITE, &s->interrupt_callback, NULL)){
+    if((ret = ffurl_open_only(&rt->rtsp_hd, tcpname, AVIO_FLAG_READ_WRITE, &s->interrupt_callback, NULL))){
         av_log(s, AV_LOG_ERROR, "Unable to alloc rtsp_hd\n");
         return ret;
     }
@@ -195,13 +223,15 @@ int rtsp_init_context(CAM_CTX *ctx)
     tc->fd = ctx->fd;
     rt->rtsp_hd->is_connected = 1;
     rt->user_agent = strdup(USER_AGENT);
-    rt->rtp_port_min = 30000;
-    rt->rtp_port_max = 60000;
+    rt->rtp_port_min = RTSP_RTP_PORT_MIN;
+    rt->rtp_port_max = RTSP_RTP_PORT_MAX;
     rt->media_type_mask = (1 << (AVMEDIA_TYPE_DATA+1)) - 1;
+#ifdef DEBUG
     int tcp_fd = ffurl_get_file_handle(rt->rtsp_hd);
     printf("tcp_fd:%d\n", tcp_fd);
+#endif
 fail:
-    return 0;
+    return err;
 }
 
 int rtsp_progress(CAM_CTX *ctx)
@@ -239,6 +269,7 @@ int rtsp_progress(CAM_CTX *ctx)
             goto fail;
         }
     } while (err);
+    av_dump_format(s, 0, rt->control_uri, 0);
     rt->lower_transport_mask = lower_transport_mask;
     av_strlcpy(rt->real_challenge, real_challenge, sizeof(rt->real_challenge));
     rt->state = RTSP_STATE_IDLE;
@@ -247,13 +278,51 @@ int rtsp_progress(CAM_CTX *ctx)
 fail:
 	return -1;
 }
+void clear_buf(int fd)
+{
+    char buf[16 * 1024];
+    int len = read(fd, buf, 16*1024);
+    printf("packet coming %d\n", len);
+}
+
+
+int rtsp_pack_ts_open(CAM_CTX *ctx, char *filename)
+{
+    if(!ctx || !filename) return -1;
+    AVFormatContext *s = ctx->ofmt_ctx;
+    if(!s) {
+        fprintf(stderr, "AVOutputFormat empty\n");
+        return -1;
+    }
+    if( avio_open(&s->pb, filename, AVIO_FLAG_WRITE) < 0){
+        fprintf(stderr, "Output file open error\n");
+        return -1;
+    }
+#ifdef DEBUG
+    fprintf(stdout, "Open output TS %s success\n", filename);
+#endif
+    return 0;
+}
+int rtsp_pack_ts_close(CAM_CTX *ctx)
+{
+    AVFormatContext *s = ctx->ofmt_ctx;
+    avio_flush(s->pb);
+    avio_close(s->pb);
+}
+
+void rtsp_frame_handler(CAM_CTX *ctx){
+    AVFormatContext *s = ctx->fmt_ctx;
+    AVFrame *frame = NULL;
+    AVCodecContext *codectx = rtsp_find_video_stream_avcodecctx(s);
+    frame = av_frame_alloc();
+    if(frame) av_free(frame);
+}
 
 int main()
 {
 	av_register_all();
 	avformat_network_init();
 	CAM_CTX *ctx = malloc(sizeof(CAM_CTX));
-    //test();
 	if(!ctx) return -1;
 
     sprintf(ctx->host, "10.211.55.2");
@@ -265,9 +334,22 @@ int main()
 		printf("Connected\n");
         ctx->fd = fd;
         rtsp_init_context(ctx);
+        rtsp_init_output_context(ctx);
         rtsp_progress(ctx);
         //PLAY
+        int ret = 0;
+        fd_set fs;
         rtsp_stream_play(ctx->fmt_ctx);
+        while(1){
+            FD_ZERO(&fs);
+            FD_SET(fd, &fs);
+            ret = select(fd+1, &fs, NULL, NULL, NULL);
+            if(ret > 0){
+                if(FD_ISSET(fd, &fs)){
+                    clear_buf(fd);
+                }
+            }
+        }
         rtsp_stream_pause(ctx->fmt_ctx);
         rtsp_stream_close(ctx->fmt_ctx);
       	close(fd);
