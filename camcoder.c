@@ -10,6 +10,9 @@
 #include "libavutil/mathematics.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/random_seed.h"
+#include "libavutil/audio_fifo.h"
+#include "libavutil/frame.h"
+
 #include "libavutil/dict.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
@@ -17,6 +20,7 @@
 #include "avio_internal.h"
 #define USER_AGENT "Camcoder-0.1"
 #include "rtsp.h"
+
 
 extern const uint8_t ff_log2_tab[256];
 typedef struct TCPContext {
@@ -30,8 +34,15 @@ typedef struct TCPContext {
 
 #include "noly.h"
 #include "camcoder.h"
+#include "sps.h"
+static char *const get_error_text(const int error)
+{
+    static char error_buffer[255];
+    av_strerror(error, error_buffer, sizeof(error_buffer));
+    return error_buffer;
+}
 
-AVCodecContext *rtsp_find_video_stream_avcodecctx(AVFormatContext *s){
+static AVCodecContext *rtsp_find_video_stream_avcodecctx(AVFormatContext *s){
     int i;
     for (i = 0; i < s->nb_streams; i++)
     {
@@ -42,7 +53,7 @@ AVCodecContext *rtsp_find_video_stream_avcodecctx(AVFormatContext *s){
     return NULL;
 }
 
-AVCodec *rtsp_find_video_stream_decoder(AVFormatContext *s){
+static AVCodec *rtsp_find_video_stream_decoder(AVFormatContext *s){
     int i;
     for (i = 0; i < s->nb_streams; i++)
     {
@@ -168,11 +179,19 @@ fail:
     return ret;
 }
 
-int rtsp_init_output_context(CAM_CTX *ctx)
+
+
+static int rtsp_init_output_context(CAM_CTX *ctx)
 {
-    AVOutputFormat      *out_fmt;
+    int idx = 0;
+    AVFormatContext     *i = ctx->fmt_ctx;
     ctx->ofmt_ctx = avformat_alloc_context();
-    if(!ctx->ofmt_ctx){
+    AVFormatContext     *o = ctx->ofmt_ctx;
+    AVCodecContext      *occ;
+    AVOutputFormat      *out_fmt;
+    AVStream            *vs;
+    //AVStream            *as;
+    if(!o){
         fprintf(stderr, "Allocate AVFormatContext failure\n");
         return -1;
     }
@@ -181,11 +200,58 @@ int rtsp_init_output_context(CAM_CTX *ctx)
         fprintf(stderr, "AVOutputFormat %s not found\n", DEFAULT_OUTPUT_FORMAT);
         return -1;
     }
-    ctx->ofmt_ctx->oformat = out_fmt;
+    o->oformat = out_fmt;
+    for(idx = 0; idx < i->nb_streams ; idx++){
+            AVCodecContext *icc = i->streams[idx]->codec;
+            vs = avformat_new_stream(o, NULL);
+            if(vs){
+                occ = vs->codec;
+                uint64_t extra_size = (uint64_t) icc->extradata_size + FF_INPUT_BUFFER_PADDING_SIZE;
+                occ->codec_id       = icc->codec_id;
+                occ->codec_type     = icc->codec_type;
+                //occ->codec_tag = icc->codec_tag;
+                //TODO check codec_tag
+                occ->bit_rate       = icc->bit_rate;
+                occ->extradata      = av_mallocz(extra_size);
+                occ->extradata_size = icc->extradata_size;
+                if(!occ->extradata){
+                    return AVERROR(ENOMEM);
+                }
+                memcpy(occ->extradata, icc->extradata, icc->extradata_size);
+                occ->bits_per_coded_sample  = icc->bits_per_coded_sample;
+                occ->time_base              = i->streams[idx]->time_base;
+            }
+        switch (i->streams[idx]->codec->codec_type){
+            case AVMEDIA_TYPE_VIDEO:
+                //i->streams[idx]->discard = AVDISCARD_NONE;
+                occ->pix_fmt                = icc->pix_fmt;
+                //occ->width                  = icc->width;
+                //occ->height                 = icc->height;
+                occ->width                  = 640;
+                occ->height                 = 480;
+                occ->has_b_frames           = icc->has_b_frames;
+printf("add video stream %d x %d\n", occ->width, occ->height);
+                break;
+            case AVMEDIA_TYPE_AUDIO:
+printf("add audio stream\n");
+                //i->streams[idx]->discard = AVDISCARD_NONE;
+                occ->channel_layout         = icc->channel_layout;
+                occ->sample_rate            = icc->sample_rate;
+                occ->channels               = icc->channels;
+                occ->frame_size             = icc->frame_size;
+                occ->audio_service_type     = icc->audio_service_type;
+                occ->block_align            = icc->block_align;
+                occ->delay                  = icc->delay;
+                break;
+            default:
+                i->streams[idx]->discard = AVDISCARD_ALL;
+                break;
+        }
+    }
     return 0;
 }
 
-int rtsp_init_context(CAM_CTX *ctx)
+static int rtsp_init_context(CAM_CTX *ctx)
 {
     int err = 0;
     int ret = 0;
@@ -230,6 +296,8 @@ int rtsp_init_context(CAM_CTX *ctx)
     int tcp_fd = ffurl_get_file_handle(rt->rtsp_hd);
     printf("tcp_fd:%d\n", tcp_fd);
 #endif
+    s->raw_packet_buffer_remaining_size = RAW_PACKET_BUFFER_SIZE;
+
 fail:
     return err;
 }
@@ -285,37 +353,90 @@ void clear_buf(int fd)
     printf("packet coming %d\n", len);
 }
 
+void rtsp_ts_file_name(char *mac, char *filename, int len)
+{
+    if(!filename || !mac) return;
+
+    time_t rawtime;
+    struct tm * timeinfo;
+    char timebuf[80];
+
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+
+    strftime (timebuf,80,"%F-%H%M%S",timeinfo);
+    snprintf(filename, len, "/tmp/%s-%s.ts", mac, timebuf);
+#ifdef DEBUG
+    printf("file path: %s\n", filename);
+#endif
+}
 
 int rtsp_pack_ts_open(CAM_CTX *ctx, char *filename)
 {
-    if(!ctx || !filename) return -1;
-    AVFormatContext *s = ctx->ofmt_ctx;
-    if(!s) {
-        fprintf(stderr, "AVOutputFormat empty\n");
-        return -1;
+    int error;
+    //AVFormatContext     *s              = ctx->fmt_ctx;
+    AVFormatContext     *d              = ctx->ofmt_ctx;
+    AVIOContext         *out_io_ctx     = NULL;
+    //AVCodecContext      *out_codec_ctx  = NULL;
+    //AVCodec             *out_codec      = NULL;
+    AVDictionary        *avdct          = NULL;
+    if ((error = avio_open(&out_io_ctx, filename,
+                           AVIO_FLAG_WRITE)) < 0) {
+        fprintf(stderr, "Could not open output file '%s' (error '%s')\n",
+                filename, get_error_text(error));
+        return error;
     }
-    if( avio_open(&s->pb, filename, AVIO_FLAG_WRITE) < 0){
-        fprintf(stderr, "Output file open error\n");
-        return -1;
+    d->pb = out_io_ctx;
+    if((error = avformat_write_header(d, &avdct)) < 0){
+        fprintf(stderr, "Could not write header for output file (%s)\n", av_err2str(error));
     }
-#ifdef DEBUG
-    fprintf(stdout, "Open output TS %s success\n", filename);
-#endif
+
+//cleanup:
     return 0;
 }
-int rtsp_pack_ts_close(CAM_CTX *ctx)
+static int rtsp_pack_ts_close(CAM_CTX *ctx)
 {
     AVFormatContext *s = ctx->ofmt_ctx;
     avio_flush(s->pb);
     avio_close(s->pb);
+    return 0;
 }
 
-void rtsp_frame_handler(CAM_CTX *ctx){
-    AVFormatContext *s = ctx->fmt_ctx;
-    AVFrame *frame = NULL;
+
+static int counter = 0;
+static int rtsp_frame_handler(CAM_CTX *ctx){
+    int ret = 0;
+    //int *got_frame = 0;
+    //AVFrame *frame = NULL;
+    AVFormatContext *s = ctx->fmt_ctx;//src AVFormatContext
+    AVFormatContext *d = ctx->ofmt_ctx;//dst AVFormatContext
+    AVPacket packet;
+    int done = av_read_frame(s, &packet);
+    if(!done){
+        if(counter == 0){
+        }
+        counter ++;
+        ret = av_interleaved_write_frame(d, &packet);
+/*
+        counter ++;
+        if(counter == 10) {
+            goto end;
+        }
+*/
+        if(ret > 0 ){
+            av_free_packet(&packet);
+            goto end;
+        }
+        av_free_packet(&packet);
+    }
+#if 0
     AVCodecContext *codectx = rtsp_find_video_stream_avcodecctx(s);
     frame = av_frame_alloc();
     if(frame) av_free(frame);
+#endif
+    return 0;
+end:
+    return -1;
 }
 
 int main()
@@ -334,19 +455,28 @@ int main()
 		printf("Connected\n");
         ctx->fd = fd;
         rtsp_init_context(ctx);
-        rtsp_init_output_context(ctx);
+        rtsp_ts_file_name("112233445566", ctx->out_file, DEFAULT_FILE_LEN);
         rtsp_progress(ctx);
         //PLAY
         int ret = 0;
         fd_set fs;
         rtsp_stream_play(ctx->fmt_ctx);
+        if(avformat_find_stream_info(ctx->fmt_ctx, NULL) < 0){
+            fprintf(stdout, "cannot find stream info of %s\n", ctx->fmt_ctx->filename);
+        }
+        rtsp_init_output_context(ctx);
+        rtsp_pack_ts_open(ctx, ctx->out_file);
+        //int start = 0;
         while(1){
             FD_ZERO(&fs);
             FD_SET(fd, &fs);
             ret = select(fd+1, &fs, NULL, NULL, NULL);
             if(ret > 0){
                 if(FD_ISSET(fd, &fs)){
-                    clear_buf(fd);
+                    //clear_buf(fd);
+                    if (rtsp_frame_handler(ctx) == -1){
+                        rtsp_pack_ts_close(ctx);
+                    }
                 }
             }
         }

@@ -3,6 +3,7 @@ CFLAGS= -Inoly
 CFLAGS+= -I./include
 #CFLAGS+=-Werror
 CFLAGS+=-Wall
+CFLAGS+=-DDEBUG
 
 LDFLAGS= noly/libnoly.a
 LDFLAGS+= libs/libavformat.a
@@ -13,7 +14,7 @@ LDFLAGS+= libs/libavutil.a
 LDFLAGS+= -lm
 LDFLAGS+= -lpthread
 LDFLAGS+= -lz
-
+.PHONY: noly camcoder test
 all: noly camcoder test
 
 noly:
