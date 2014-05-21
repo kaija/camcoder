@@ -23,6 +23,7 @@ typedef struct ipcam_ctx{
     int                 audio_idx;                      // Input RTSP audio stream index
     double              video_start_pts;                // the record file start pts
     int                 first_frame_got;                // Got the key frame, start save frame to file
+    int                 thumbnail_got;                // Got the key frame, start save frame to file
     AVCodecContext      *video_ctx;                     // RTSP video context
     AVFormatContext     *fmt_ctx;                       // RTSP video input context
     AVFormatContext     *ofmt_ctx;                      // MPEG-TS video output context

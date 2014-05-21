@@ -21,6 +21,8 @@
 #include "avformat.h"
 #include "avio_internal.h"
 #include "rtsp.h"
+#include "log.h"
+
 #define USER_AGENT "Camcoder-0.1"
 
 extern const uint8_t ff_log2_tab[256];
@@ -196,12 +198,12 @@ static int rtsp_init_output_context(CAM_CTX *ctx)
     AVStream            *vs;
     //AVStream            *as;
     if(!o){
-        fprintf(stderr, "Allocate AVFormatContext failure\n");
+        LOG(LOG_ERROR, "Allocate AVFormatContext failure\n");
         return -1;
     }
     out_fmt = av_guess_format(DEFAULT_OUTPUT_FORMAT, NULL, NULL);
     if(!out_fmt){
-        fprintf(stderr, "AVOutputFormat %s not found\n", DEFAULT_OUTPUT_FORMAT);
+        LOG(LOG_ERROR, "AVOutputFormat %s not found\n", DEFAULT_OUTPUT_FORMAT);
         return -1;
     }
     o->oformat = out_fmt;
@@ -230,13 +232,10 @@ static int rtsp_init_output_context(CAM_CTX *ctx)
                 ctx->video_idx = idx;
                 //i->streams[idx]->discard = AVDISCARD_NONE;
                 occ->pix_fmt                = icc->pix_fmt;
-                //occ->width                  = icc->width;
-                //occ->height                 = icc->height;
-                //FIXME
-                occ->width                  = 640;
-                occ->height                 = 480;
+                occ->width                  = icc->width;
+                occ->height                 = icc->height;
                 occ->has_b_frames           = icc->has_b_frames;
-printf("add video stream %d x %d\n", occ->width, occ->height);
+                LOG(LOG_DEBUG, "add video stream %d x %d\n", occ->width, occ->height);
                 break;
             case AVMEDIA_TYPE_AUDIO:
                 ctx->audio_idx = idx;
@@ -248,7 +247,7 @@ printf("add video stream %d x %d\n", occ->width, occ->height);
                 occ->audio_service_type     = icc->audio_service_type;
                 occ->block_align            = icc->block_align;
                 occ->delay                  = icc->delay;
-printf("add audio stream\n");
+                LOG(LOG_DEBUG, "add audio stream\n");
                 break;
             default:
                 i->streams[idx]->discard = AVDISCARD_ALL;
@@ -304,7 +303,7 @@ static int rtsp_init_context(CAM_CTX *ctx)
     rt->media_type_mask = (1 << (AVMEDIA_TYPE_DATA+1)) - 1;
 #ifdef DEBUG
     int tcp_fd = ffurl_get_file_handle(rt->rtsp_hd);
-    printf("FD:%d assigned to %s\n", tcp_fd, rt->control_uri);
+    //printf("FD:%d assigned to %s\n", tcp_fd, rt->control_uri);
 #endif
     s->raw_packet_buffer_remaining_size = RAW_PACKET_BUFFER_SIZE;
 
@@ -333,7 +332,7 @@ int rtsp_progress(CAM_CTX *ctx)
         err = ff_rtsp_setup_input_streams(s, reply);
     }
     //SETUP
-    printf("number of rtsp streams %d\n",rt->nb_rtsp_streams);
+    //printf("number of rtsp streams %d\n",rt->nb_rtsp_streams);
     do {
         int lower_transport = RTSP_LOWER_TRANSPORT_TCP;
         err = ff_rtsp_make_setup_request(s, ctx->host, ctx->port, lower_transport,
@@ -349,7 +348,7 @@ int rtsp_progress(CAM_CTX *ctx)
     } while (err);
 #ifdef DEBUG
     av_dump_format(s, 0, rt->control_uri, 0);
-    printf("Keepalive timeout %d\n", rt->timeout);
+    //printf("Keepalive timeout %d\n", rt->timeout);
 #endif
     rt->lower_transport_mask = lower_transport_mask;
     av_strlcpy(rt->real_challenge, real_challenge, sizeof(rt->real_challenge));
@@ -363,7 +362,7 @@ void clear_buf(int fd)
 {
     char buf[16 * 1024];
     int len = read(fd, buf, 16*1024);
-    printf("packet coming %d\n", len);
+    //printf("packet coming %d\n", len);
 }
 
 void rtsp_ts_file_name(char *mac, char *filename, int len)
@@ -380,7 +379,7 @@ void rtsp_ts_file_name(char *mac, char *filename, int len)
     strftime (timebuf,80,"%F-%H%M%S",timeinfo);
     snprintf(filename, len, "/tmp/%s-%s.ts", mac, timebuf);
 #ifdef DEBUG
-    printf("file path: %s\n", filename);
+    //LOG(LOG_DEBUG, "file path: %s\n", filename);
 #endif
 }
 
@@ -398,7 +397,7 @@ void rtsp_thumbnail_file_name(char *mac, char *filename, int len)
     strftime (timebuf,80,"%F-%H%M%S",timeinfo);
     snprintf(filename, len, "/tmp/%s-%s.jpg", mac, timebuf);
 #ifdef DEBUG
-    printf("file path: %s\n", filename);
+   // printf("file path: %s\n", filename);
 #endif
 }
 
@@ -413,15 +412,16 @@ static int rtsp_pack_ts_open(CAM_CTX *ctx, char *filename)
     AVDictionary        *avdct          = NULL;
     if ((error = avio_open(&out_io_ctx, filename,
                            AVIO_FLAG_WRITE)) < 0) {
-        fprintf(stderr, "Could not open output file '%s' (error '%s')\n",
+        LOG(LOG_ERROR, "Could not open output file '%s' (error '%s')\n",
                 filename, get_error_text(error));
         goto error;
     }
     d->pb = out_io_ctx;
     if((error = avformat_write_header(d, &avdct)) < 0){
-        fprintf(stderr, "Could not write header for output file (%s)\n", av_err2str(error));
+        LOG(LOG_ERROR, "Could not write header for output file (%s)\n", av_err2str(error));
         goto cleanup;
     }
+    ctx->thumbnail_got = 0;
     return 0;
 cleanup:
     avio_close(d->pb);
@@ -437,7 +437,7 @@ static int rtsp_pack_ts_check(CAM_CTX *ctx)
     if(!d->pb){//If file not exist create it.
         rtsp_ts_file_name(ctx->id, ctx->out_file, DEFAULT_FILE_LEN);
         rtsp_pack_ts_open(ctx, ctx->out_file);
-        fprintf(stdout, "MPEG-TS file %s created\n", ctx->out_file);
+        LOG(LOG_DEBUG, "MPEG-TS file %s created\n", ctx->out_file);
         return 1;
     }
     return 0;
@@ -447,6 +447,7 @@ static int rtsp_pack_ts_close(CAM_CTX *ctx)
 {
     AVFormatContext *d = ctx->ofmt_ctx;
     avio_flush(d->pb);
+    av_interleaved_write_frame(d, NULL);
     avio_close(d->pb);
     d->pb = NULL;
     return 0;
@@ -460,12 +461,12 @@ static int create_thumbnail(CAM_CTX *ctx, AVCodecContext *rtsp_ctx, AVFrame *fra
     AVCodecContext *jpg_ctx = NULL;
     jpg_codec = avcodec_find_encoder(CODEC_ID_MJPEG);
     if(!jpg_codec){
-        fprintf(stderr, "MJPEG codec not found\n");
+        LOG(LOG_ERROR, "MJPEG codec not found\n");
         goto err;
     }
     jpg_ctx = avcodec_alloc_context3(jpg_codec);
     if(!jpg_ctx){
-        fprintf(stderr, "alloc MJPEG Context failure\n");
+        LOG(LOG_ERROR, "alloc MJPEG Context failure\n");
         goto err;
     }
     jpg_ctx->bit_rate = rtsp_ctx->bit_rate;
@@ -483,13 +484,13 @@ static int create_thumbnail(CAM_CTX *ctx, AVCodecContext *rtsp_ctx, AVFrame *fra
     jpg_ctx->strict_std_compliance = -1;
     //open mjpeg codec
     if(avcodec_open2(jpg_ctx, jpg_codec, NULL) < 0){
-        fprintf(stderr, "could not open codec\n");
+        LOG(LOG_ERROR, "could not open codec\n");
         goto err;
     }
     //open jpeg file
     FILE *fp = fopen(filename, "wb");
     if(!fp){
-        fprintf(stderr, "could not open jpg\n");
+        LOG(LOG_ERROR, "could not open jpg\n");
         goto err;
     }
     AVFrame *scale_frame = av_frame_alloc();
@@ -521,7 +522,7 @@ static int create_thumbnail(CAM_CTX *ctx, AVCodecContext *rtsp_ctx, AVFrame *fra
     int got_out;
     ret = avcodec_encode_video2(jpg_ctx, &pkt, scale_frame, &got_out);
     if(ret < 0){
-        fprintf(stderr, "avcode_encode_video2 encode jpeg failure\n");
+        LOG(LOG_ERROR, "avcode_encode_video2 encode jpeg failure\n");
         goto err;
     }
     if(got_out){
@@ -576,7 +577,7 @@ static int rtsp_frame_handler(CAM_CTX *ctx){
                 }
                 double clip_duration = pts2time(pkt.pts, &s->streams[pkt.stream_index]->time_base) - ctx->video_start_pts;
                 if(clip_duration >= ctx->video_duration){ // file length reache
-                    printf("clip duraiton %0.3g close file\n", clip_duration);
+                    LOG(LOG_DEBUG, "Save clip duraiton %0.3g s\n", clip_duration);
                     rtsp_pack_ts_close(ctx);
                     av_free_packet(&pkt);
                     goto end;
@@ -591,29 +592,20 @@ static int rtsp_frame_handler(CAM_CTX *ctx){
                     pkt.size
             );
 #endif
-            //if (ctx->first_frame_got == 0 && pkt.stream_index == ctx->video_idx && pkt.flags & AV_PKT_FLAG_KEY){
-                //create thumbnail
-            if (pkt.stream_index == ctx->video_idx && pkt.flags & AV_PKT_FLAG_KEY){
-#ifdef DEBUG
-                fprintf(stdout, "Create thumbnail start\n");
-#endif
-                //AVCodecContext *codectx = rtsp_find_video_stream_avcodecctx(s);
+            if (pkt.stream_index == ctx->video_idx && ctx->thumbnail_got == 0){
                 AVFrame *thumb = av_frame_alloc();
-                //printf("%s%d\n",__FILE__,__LINE__);
                 int got_pic = 0;
                 int len = avcodec_decode_video2(ctx->video_ctx, thumb, &got_pic, &pkt);
                 if(len < 0){
-                    fprintf(stdout, "avcodec_decode_video2 decode failure\n");
+                    LOG(LOG_ERROR, "avcodec_decode_video2 decode failure\n");
                     goto write;
                 }
                 if(got_pic){
                     thumb->quality = 4;
                     thumb->pts = 0;
                     create_thumbnail(ctx, ctx->video_ctx, thumb);
+                    ctx->thumbnail_got = 1;
                 }
-#ifdef DEBUG
-                fprintf(stdout, "Create thumbnail end\n");
-#endif
             }
 write:
                 //printf("Got key frame start write\n");
@@ -625,20 +617,14 @@ write:
                 }
             }
             if(ctx->first_frame_got == 1 ){
-#ifdef DEBUG
-                fprintf(stdout, "av_interleaved_write_frame start\n");
-#endif
                 ret = av_interleaved_write_frame(d, &pkt);
                 if(ret != 0){
-                    fprintf(stderr, "write frame error %d\n", ret);
+                    LOG(LOG_ERROR, "write frame error code (%d)\n", ret);
                 }
-#ifdef DEBUG
-                fprintf(stdout, "av_interleaved_write_frame end\n");
-#endif
             }
         }else{
             //open file error
-            fprintf(stderr, "cannot open output media file");
+            LOG(LOG_ERROR, "cannot open output media file");
             goto error;
         }
         av_free_packet(&pkt);
@@ -660,10 +646,15 @@ void camera_context_init(CAM_CTX *ctx)
     memset(ctx, 0, sizeof(ctx));
     ctx->record_enable = 1;
     ctx->video_duration = 5; //Record to file every 5 second
+    ctx->thumbnail_got = 0;
 }
 
 int main()
 {
+    log_set_file("/tmp/camcoder.log");
+
+    LOG(LOG_DEBUG, "%s", "Camera recorder server started\n");
+
     AVCodec *video_codec = NULL;
 	av_register_all();
 	avformat_network_init();
@@ -671,13 +662,13 @@ int main()
     memset(ctx, 0,sizeof(ctx));
 	if(!ctx) return -1;
 
-    //sprintf(ctx->host, "192.168.15.136");
-    sprintf(ctx->host, "10.211.55.2");
-    ctx->port = 8554;
+    sprintf(ctx->host, "192.168.1.137");
+    //sprintf(ctx->host, "10.211.55.2");
+    ctx->port = 554;
     //ctx->port = 8554;
-    //sprintf(ctx->path, "/ChannelID=1&ChannelName=Channel1");
+    sprintf(ctx->path, "/ChannelID=1&ChannelName=Channel1");
     sprintf(ctx->id, "112233445566");
-    sprintf(ctx->path, "/demo.264");
+    //sprintf(ctx->path, "/demo.264");
     ctx->video_duration = 5;
 	int fd = noly_tcp_connect(ctx->host, ctx->port);
     if(fd) {
@@ -690,13 +681,13 @@ int main()
         fd_set fs;
         rtsp_stream_play(ctx->fmt_ctx);
         if(avformat_find_stream_info(ctx->fmt_ctx, NULL) < 0){
-            fprintf(stdout, "cannot find stream info of %s\n", ctx->fmt_ctx->filename);
+            LOG(LOG_ERROR, "cannot find stream info of %s\n", ctx->fmt_ctx->filename);
         }
         rtsp_init_output_context(ctx);
         ctx->video_ctx = rtsp_find_video_stream_avcodecctx(ctx->fmt_ctx);
         video_codec = avcodec_find_decoder(ctx->video_ctx->codec_id);
         if(avcodec_open2(ctx->video_ctx, video_codec, NULL) < 0){
-            fprintf(stderr, "Cannot open video codec for thumbnail\n");
+            LOG(LOG_ERROR, "Cannot open video codec for thumbnail\n");
         }
         while(1){
             FD_ZERO(&fs);

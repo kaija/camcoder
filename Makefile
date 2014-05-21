@@ -4,6 +4,7 @@ CFLAGS+= -I./include
 #CFLAGS+=-Werror
 CFLAGS+=-Wall
 CFLAGS+=-DDEBUG
+CFLAGS+=-DCOLOR_LOG
 
 LDFLAGS= noly/libnoly.a
 LDFLAGS+= libs/libavformat.a
@@ -20,8 +21,8 @@ all: noly camcoder test
 noly:
 	$(MAKE) -C noly
 
-camcoder: camcoder.o
-	$(CC) -o camcoder.exe camcoder.o $(CFLAGS) $(LDFLAGS)
+camcoder: log.o camcoder.o
+	$(CC) -o camcoder.exe log.o camcoder.o $(CFLAGS) $(LDFLAGS)
 
 test: test.o
 	$(CC) -o test.exe test.o $(CFLAGS) $(LDFLAGS)
