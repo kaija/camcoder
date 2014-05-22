@@ -8,6 +8,7 @@
 #define DEFAULT_PATH_LEN    128
 #define DEFAULT_FILE_LEN    128
 #define CAMERA_ID_LEN       32
+#define CAM_REC_TOLERANCE   0.05
 
 typedef struct ipcam_ctx{
     int                 fd;                             // the ipcamera socket fd

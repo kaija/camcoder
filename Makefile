@@ -12,9 +12,16 @@ LDFLAGS+= libs/libavfilter.a
 LDFLAGS+= libs/libavcodec.a
 LDFLAGS+= libs/libavutil.a
 LDFLAGS+= libs/libswscale.a
+LDFLAGS+= libs/libswresample.a
+#LDFLAGS+= -lavformat
+#LDFLAGS+= -lavfilter
+#LDFLAGS+= -lavcodec
+#LDFLAGS+= -lavutil
+#LDFLAGS+= -lswscale
 LDFLAGS+= -lm
 LDFLAGS+= -lpthread
 LDFLAGS+= -lz
+LDFLAGS+= -lrt
 .PHONY: noly camcoder test
 all: noly camcoder test
 

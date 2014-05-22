@@ -302,7 +302,7 @@ static int rtsp_init_context(CAM_CTX *ctx)
     rt->rtp_port_max = RTSP_RTP_PORT_MAX;
     rt->media_type_mask = (1 << (AVMEDIA_TYPE_DATA+1)) - 1;
 #ifdef DEBUG
-    int tcp_fd = ffurl_get_file_handle(rt->rtsp_hd);
+    //int tcp_fd = ffurl_get_file_handle(rt->rtsp_hd);
     //printf("FD:%d assigned to %s\n", tcp_fd, rt->control_uri);
 #endif
     s->raw_packet_buffer_remaining_size = RAW_PACKET_BUFFER_SIZE;
@@ -358,13 +358,14 @@ int rtsp_progress(CAM_CTX *ctx)
 fail:
 	return -1;
 }
+#if 0
 void clear_buf(int fd)
 {
     char buf[16 * 1024];
     int len = read(fd, buf, 16*1024);
     //printf("packet coming %d\n", len);
 }
-
+#endif
 void rtsp_ts_file_name(char *mac, char *filename, int len)
 {
     if(!filename || !mac) return;
@@ -446,6 +447,7 @@ static int rtsp_pack_ts_check(CAM_CTX *ctx)
 static int rtsp_pack_ts_close(CAM_CTX *ctx)
 {
     AVFormatContext *d = ctx->ofmt_ctx;
+    av_write_trailer(d);
     avio_flush(d->pb);
     av_interleaved_write_frame(d, NULL);
     avio_close(d->pb);
@@ -558,77 +560,86 @@ static int rtsp_frame_handler(CAM_CTX *ctx){
             av_free_packet(&pkt);
             goto end;
         }
-        if(ctx->record_enable == 0){
-            av_free_packet(&pkt);
-            //TODO pause this stream and close it now? not sure!!!
-            rtsp_stream_pause(ctx->fmt_ctx);
-            //rtsp_stream_close(ctx->fmt_ctx);
-            goto end;
-        }
-        if((ret = rtsp_pack_ts_check(ctx)) >= 0){
-            //Now is recording, save packet to file
-            //reach video record file length
-            if(ret == 1) {//new file
-                ctx->video_start_pts = 0;
-                ctx->first_frame_got = 0;
-            }else{
-                if(ctx->video_start_pts == 0){
-                    ctx->video_start_pts = pts2time(pkt.pts, &s->streams[pkt.stream_index]->time_base);
-                }
+    }
+    if(ctx->record_enable == 0){
+        av_free_packet(&pkt);
+        //TODO pause this stream and close it now? not sure!!!
+        rtsp_stream_pause(ctx->fmt_ctx);
+        //rtsp_stream_close(ctx->fmt_ctx);
+        goto end;
+    }
+restart:
+    if((ret = rtsp_pack_ts_check(ctx)) >= 0){
+        //Now is recording, save packet to file
+        //reach video record file length
+        if(ret == 1) {//new file
+            ctx->video_start_pts = 0;
+            ctx->first_frame_got = 0;
+        }else{
+            if(ctx->video_start_pts == 0){
+                ctx->video_start_pts = pts2time(pkt.pts, &s->streams[pkt.stream_index]->time_base);
+            }
+
+            if(pkt.flags && AV_PKT_FLAG_KEY){//Check if 
                 double clip_duration = pts2time(pkt.pts, &s->streams[pkt.stream_index]->time_base) - ctx->video_start_pts;
-                if(clip_duration >= ctx->video_duration){ // file length reache
+                if(clip_duration >= ctx->video_duration - CAM_REC_TOLERANCE){ // file length reache
                     LOG(LOG_DEBUG, "Save clip duraiton %0.3g s\n", clip_duration);
                     rtsp_pack_ts_close(ctx);
-                    av_free_packet(&pkt);
-                    goto end;
+                    //av_free_packet(&pkt);   // Not free packet here goto rtsp_pack_ts and create new file.
+                    goto restart;
                 }
             }
+        }
 #ifdef DEBUGFRAME
-            av_log(NULL, AV_LOG_INFO, "muxer <- type:%s "
-                    "pkt_pts:%s pkt_pts_time:%s pkt_dts:%s pkt_dts_time:%s size:%d\n",
-                    av_get_media_type_string(s->streams[ctx->video_idx]->codec->codec_type),
-                    av_ts2str(pkt.pts), av_ts2timestr(pkt.pts, &s->streams[pkt.stream_index]->time_base),
-                    av_ts2str(pkt.dts), av_ts2timestr(pkt.dts, &s->streams[pkt.stream_index]->time_base),
-                    pkt.size
-            );
+        av_log(NULL, AV_LOG_INFO, "muxer <- type:%s "
+                "pkt_pts:%s pkt_pts_time:%s pkt_dts:%s pkt_dts_time:%s size:%d\n",
+                av_get_media_type_string(s->streams[ctx->video_idx]->codec->codec_type),
+                av_ts2str(pkt.pts), av_ts2timestr(pkt.pts, &s->streams[pkt.stream_index]->time_base),
+                av_ts2str(pkt.dts), av_ts2timestr(pkt.dts, &s->streams[pkt.stream_index]->time_base),
+                pkt.size
+        );
 #endif
-            if (pkt.stream_index == ctx->video_idx && ctx->thumbnail_got == 0){
-                AVFrame *thumb = av_frame_alloc();
-                int got_pic = 0;
-                int len = avcodec_decode_video2(ctx->video_ctx, thumb, &got_pic, &pkt);
-                if(len < 0){
-                    LOG(LOG_ERROR, "avcodec_decode_video2 decode failure\n");
-                    goto write;
-                }
-                if(got_pic){
-                    thumb->quality = 4;
-                    thumb->pts = 0;
-                    create_thumbnail(ctx, ctx->video_ctx, thumb);
-                    ctx->thumbnail_got = 1;
-                }
+        if(pkt.flags & AV_PKT_FLAG_KEY){
+            LOG(LOG_DEBUG, "Got key/I frame\n");
+        }
+#if 1
+        if (pkt.stream_index == ctx->video_idx && ctx->thumbnail_got == 0 && pkt.flags && AV_PKT_FLAG_KEY){
+            AVFrame *thumb = av_frame_alloc();
+            int got_pic = 0;
+            int len = avcodec_decode_video2(ctx->video_ctx, thumb, &got_pic, &pkt);
+            if(len < 0){
+                LOG(LOG_ERROR, "avcodec_decode_video2 decode failure\n");
+                goto write;
             }
+            if(got_pic){
+                thumb->quality = 4;
+                thumb->pts = 0;
+                create_thumbnail(ctx, ctx->video_ctx, thumb);
+                ctx->thumbnail_got = 1;
+            }
+        }
+#endif
 write:
                 //printf("Got key frame start write\n");
-            if(ctx->first_frame_got == 0){
-                if(pkt.pts != AV_NOPTS_VALUE){
-                    ctx->first_frame_got = 1;
-                }else{
-                    printf("Skip first no pts frame\n");
-                }
+        if(ctx->first_frame_got == 0){
+            if(pkt.pts != AV_NOPTS_VALUE){
+                ctx->first_frame_got = 1;
+            }else{
+                printf("Skip first no pts frame\n");
             }
-            if(ctx->first_frame_got == 1 ){
-                ret = av_interleaved_write_frame(d, &pkt);
-                if(ret != 0){
-                    LOG(LOG_ERROR, "write frame error code (%d)\n", ret);
-                }
+        }
+        //if(ctx->first_frame_got == 1 ){
+            ret = av_interleaved_write_frame(d, &pkt);
+            if(ret != 0){
+                LOG(LOG_ERROR, "write frame error code (%d)\n", ret);
             }
-        }else{
-            //open file error
+        //}
+    }else{
+        //open file error
             LOG(LOG_ERROR, "cannot open output media file");
             goto error;
-        }
-        av_free_packet(&pkt);
     }
+    av_free_packet(&pkt);
 #if 0
     AVCodecContext *codectx = rtsp_find_video_stream_avcodecctx(s);
     frame = av_frame_alloc();
